@@ -145,7 +145,7 @@ where $S$ is the spot rate, $D_f(T)$ is the foreign discount factor, and $D_d(T)
 
 Computes portfolio-level NPV, spot delta per currency pair, cross-gamma, and parametric VaR (99%, 1-day):
 
-$$\text{VaR}_{99\%} = \sum_i \delta_i \cdot \sigma_i \cdot z_{0.99} \cdot S_i$$
+$$\text{VaR}_{99} = \sum_i \delta_i \cdot \sigma_i \cdot z_{0.99} \cdot S_i$$
 
 where $\delta_i$ is the spot delta for pair $i$, $\sigma_i$ is daily volatility, and $z_{0.99} = 2.326$.
 
