@@ -1,0 +1,36 @@
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.so
+*.pyd
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data caches (large files, reproducible)
+data/databento_cache/
+data/yfinance_cache/
+data/cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keep output images for README (tracked explicitly)
+# Do NOT ignore output/*.png
+*.pdb
