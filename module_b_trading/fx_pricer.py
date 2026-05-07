@@ -57,11 +57,17 @@ class FXPricer:
         Currency pair identifier, e.g. 'EUR/USD'.
     """
 
-    def __init__(self, domestic_curve, foreign_curve, spot_rate: float, pair_name: str):
+    def __init__(self, domestic_curve, foreign_curve, spot_rate: float, pair_name: str,
+                 market_curve=None):
         self.domestic_curve = domestic_curve
         self.foreign_curve = foreign_curve
         self.spot_rate = spot_rate
         self.pair_name = pair_name
+        # Optional: a `market_forward.MarketForwardCurve` carrying CME-quoted
+        # forwards. When supplied, `fx_swap_npv` marks against the exchange
+        # forward instead of the CIP-implied one. Greeks keep using CIP
+        # because they need a smooth analytical function.
+        self.market_curve = market_curve
 
     # ------------------------------------------------------------------
     # Core pricing
@@ -119,7 +125,10 @@ class FXPricer:
         float
             NPV in domestic currency.
         """
-        f_market = self.forward_price(maturity)
+        if self.market_curve is not None:
+            f_market, _src = self.market_curve.f_market(maturity)
+        else:
+            f_market = self.forward_price(maturity)
         d_domestic = self._discount_domestic(maturity)
         return notional * (f_market - forward_rate_agreed) * d_domestic
 

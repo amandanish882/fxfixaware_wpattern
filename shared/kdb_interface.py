@@ -36,7 +36,22 @@ except ImportError:
 
 
 class KDBInterface:
-    """Thin wrapper around a KDB+ process (or in-memory fallback)."""
+    """Thin wrapper around a KDB+ process (or in-memory fallback).
+
+    The in-memory fallback (used when no real ``q.exe`` is running) is shared
+    at the **class level** so that data written by one ``KDBInterface``
+    instance is visible to every subsequent instance in the same Python
+    process.  Without this sharing, Step 0c's writes vanish before Step 5b
+    reads them, which silently downgrades the L2 book walk to synthetic.
+    When a real KDB+ process is connected, ``self.conn is not None`` and the
+    fallback is bypassed entirely.
+    """
+
+    # Class-level in-memory fallback shared across instances.  This stand-in
+    # for the KDB+ tables only matters when ``HAS_QPYTHON`` is False or the
+    # connection fails.  When a real KDB+ process is reachable, every read
+    # and write goes through ``self.conn`` and this dict is unused.
+    _SHARED_FALLBACK: dict[str, pd.DataFrame] = {}
 
     # ------------------------------------------------------------------ init
     def __init__(self, host: str = "localhost", port: int = 5000) -> None:
@@ -53,7 +68,10 @@ class KDBInterface:
         self.host = host
         self.port = port
         self.conn = None
-        self._fallback: dict[str, pd.DataFrame] = {}
+        # Bind the shared dict to ``self._fallback`` so existing methods that
+        # read ``self._fallback`` continue to work unchanged.  Mutations go
+        # through this same dict object, so all instances see them.
+        self._fallback = type(self)._SHARED_FALLBACK
 
         if HAS_QPYTHON:
             try:

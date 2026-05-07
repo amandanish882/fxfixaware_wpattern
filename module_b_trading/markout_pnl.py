@@ -10,15 +10,21 @@ Key insight (Krohn, Mueller & Whelan 2024):
     - At-fix fills show WORSE markouts (adverse selection from fix order flow)
     - Post-fix fills are mixed (reversal can help or hurt)
 
-P&L decomposition:
-    total_pnl = edge_pips + fix_alpha_pips + carry_pips - hedge_cost_pips + residual_pips
+P&L decomposition (additive, identity holds exactly by construction):
+    total_pnl = edge_pips + fix_alpha_pips + carry_pips + hedge_cost_pips + markout_drift_pips
 
 where:
-    edge_pips: half the quoted spread captured (the "market-making edge")
-    fix_alpha_pips: P&L from trading with/against the fix drift
-    carry_pips: interest rate differential earned over the holding period
-    hedge_cost_pips: execution slippage from hedging in the interbank market
-    residual_pips: unexplained noise / model error
+    edge_pips: half the quoted spread captured at fill ("market-making edge")
+    fix_alpha_pips: expected pre/post-fix W-shape contribution (small; only fires
+        in fix windows, scaled by proximity)
+    carry_pips: interest-rate differential earned over the holding period
+    hedge_cost_pips: execution slippage paid on the hedge (negative)
+    markout_drift_pips: realized post-fill mid-price drift NOT already attributed
+        to fix_alpha or carry. On a 30-min markout this is the dominant term —
+        it captures the random-walk component plus any unmodeled directional
+        edge (autocorrelation, microstructural mean-reversion, RFQ-generator
+        bias). Often called "residual" but it is NOT model error: it is
+        explicit unattributed price drift, observable on the tape.
 """
 
 import numpy as np
@@ -35,13 +41,75 @@ except ImportError:
     _HAS_YFINANCE = False
 
 
-# Default daily volatilities in pips per pair
-DEFAULT_DAILY_VOL_PIPS = {
+# Default daily volatilities in pips per pair.
+#
+# Calibrated from the real CME 15-min cache (`data/cme_15m_cache.parquet`)
+# when present, falling back to hardcoded textbook estimates otherwise.
+# Note: the cache covers fix-window data only (13:00-17:00 UTC), so the
+# resulting daily-vol numbers are somewhat compressed relative to full-day
+# market vol. That's acceptable for fix-conditioned markout sizing.
+def _calibrate_daily_vol_pips():
+    """Compute daily vol in pips per G4 pair from the real CME 15m cache.
+
+    Aggregates 15-min log returns to daily, takes std, converts to pips
+    (10000 for non-JPY pairs, 100 for JPY pairs).
+    Falls back to {} if the cache is missing or empty.
+    """
+    from pathlib import Path
+    import numpy as np
+    import pandas as pd
+    cache = Path(__file__).resolve().parent.parent / "data" / "cme_15m_cache.parquet"
+    if not cache.exists():
+        return {}
+    try:
+        df = pd.read_parquet(cache, columns=["timestamp", "pair", "return_15m"])
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+    # Aggregate to daily log return per pair
+    df["date"] = pd.to_datetime(df["timestamp"]).dt.date
+    daily = df.groupby(["pair", "date"])["return_15m"].sum().reset_index()
+    out = {}
+    for pair, sub in daily.groupby("pair"):
+        if len(sub) < 5:
+            continue
+        sigma = float(sub["return_15m"].std())
+        # Convert log return std to pips: pips = sigma * spot_proxy * pip_factor
+        # We don't have spot here cleanly, so report return std in pips relative to a unit price.
+        # For "daily vol pips" the convention is sigma_log * spot * pip_factor; but without spot
+        # we use the convention sigma_log * 1e4 (which is bps -> pips for non-JPY) and
+        # sigma_log * 100 for JPY pairs (since JPY pip is 0.01 and spot ~150 -> pip_factor 100).
+        if "JPY" in pair:
+            pips = sigma * 100
+        else:
+            pips = sigma * 10000
+        out[pair] = round(pips, 1)
+    return out
+
+
+_HARDCODED_DAILY_VOL_PIPS = {
     "EUR/USD": 50,   # ~50 pips/day for EUR/USD
     "GBP/USD": 70,   # Cable is more volatile
     "JPY/USD": 60,   # ~60 pips in JPY terms
     "AUD/USD": 80,   # Aussie dollar is most volatile of G4
 }
+
+
+def _load_daily_vol_pips():
+    """Calibrated values where available, hardcoded fallback elsewhere."""
+    merged = dict(_HARDCODED_DAILY_VOL_PIPS)
+    try:
+        cal = _calibrate_daily_vol_pips()
+        for k, v in cal.items():
+            if v > 0:
+                merged[k] = v
+    except Exception:
+        pass
+    return merged
+
+
+DEFAULT_DAILY_VOL_PIPS = _load_daily_vol_pips()
 
 # Default execution costs in pips (round-trip slippage for hedging)
 DEFAULT_EXECUTION_COSTS = {
@@ -407,22 +475,31 @@ class FXMarkoutAnalyzer:
     # ------------------------------------------------------------------
 
     def pnl_decomposition(self, filled_rfqs: pd.DataFrame) -> pd.DataFrame:
-        """Decompose total P&L into components for each filled RFQ.
+        """Decompose total P&L into additive components for each filled RFQ.
+
+        The identity ``total_pnl = edge + fix_alpha + carry + hedge_cost +
+        markout_drift`` holds exactly by construction; ``markout_drift`` is
+        whatever the realized 30-min markout still contains after the four
+        other modeled components are subtracted out — i.e., the unmodeled mid
+        drift the price actually delivered.
 
         Components:
             edge_pips: half-spread capture (quoted_spread / 2)
-            fix_alpha_pips: P&L from fix-timing signal
+            fix_alpha_pips: expected fix-window contribution
             carry_pips: interest rate differential over holding period
             hedge_cost_pips: execution slippage (negative)
-            residual_pips: total - (edge + fix_alpha + carry - hedge_cost)
+            markout_drift_pips: realized post-fill mid drift not modeled above
+                (formerly named ``residual_pips``; kept as alias for
+                backwards compatibility)
 
-        Example:
-            Total markout at 30m = 0.78 pips
-            edge = 0.41 pips (half of 0.82 quoted spread)
-            fix_alpha = 0.30 pips (pre-fix, favorable drift)
-            carry = 0.01 pips (tiny at 30-min horizon)
-            hedge_cost = -0.10 pips
-            residual = 0.78 - (0.41 + 0.30 + 0.01 - 0.10) = 0.16 pips
+        Example (typical 30-min horizon):
+            Total markout = +4.79 pips
+            edge = +0.62 pips, fix_alpha = +0.05, carry = +0.01,
+            hedge_cost = -0.88
+            markout_drift = +4.79 - (0.62 + 0.05 + 0.01 - 0.88) = +4.99 pips
+            (the price drifted +5 pips in our favor on average — most of it
+             is random walk noise, some of it is unmodeled directional edge
+             beyond the explicit fix_alpha component)
 
         Parameters
         ----------
@@ -433,7 +510,8 @@ class FXMarkoutAnalyzer:
         -------
         pd.DataFrame
             Original columns plus edge_pips, fix_alpha_pips, carry_pips,
-            hedge_cost_pips, residual_pips, total_pnl_pips.
+            hedge_cost_pips, markout_drift_pips (alias residual_pips),
+            total_pnl_pips.
         """
         df = self.compute_markouts(filled_rfqs)
 
@@ -451,16 +529,18 @@ class FXMarkoutAnalyzer:
         # 3. Carry P&L (tiny at intraday horizons)
         df["carry_pips"] = self._compute_carry_pnl(df)
 
-        # 4. Hedge cost (negative) — per-trade execution cost in pips
-        # Cap at realistic per-trade levels (0.05-0.25 pips for G4 FX)
-        # The execution_costs dict may contain portfolio-level costs which are
-        # too large for individual RFQ fills
+        # 4. Hedge cost (negative) — per-trade execution cost in pips.
+        # Caps are a fat-finger safety net only: a typical G4 hedge runs
+        # 0.05-3 pips depending on pair (JPY/USD is widest because the contract
+        # is small-tick and orders are large). The cap kicks in only on
+        # obviously-bad inputs (>5 pips ≈ 50 bps would be clearly nonsense).
+        # Realised TWAP slippage from Step 5b passes through unmodified.
         _PER_TRADE_COST_CAPS = {
-            "EUR/USD": 0.10, "GBP/USD": 0.15,
-            "JPY/USD": 0.12, "AUD/USD": 0.20,
+            "EUR/USD": 5.0, "GBP/USD": 5.0,
+            "JPY/USD": 5.0, "AUD/USD": 5.0,
         }
         raw_costs = df["pair"].map(self.execution_costs).fillna(0.15)
-        cost_caps = df["pair"].map(_PER_TRADE_COST_CAPS).fillna(0.15)
+        cost_caps = df["pair"].map(_PER_TRADE_COST_CAPS).fillna(5.0)
         df["hedge_cost_pips"] = -np.minimum(raw_costs, cost_caps)
 
         # 5. Total P&L: use 30-min markout as the primary horizon
@@ -470,14 +550,20 @@ class FXMarkoutAnalyzer:
         else:
             df["total_pnl_pips"] = df["edge_pips"] + df["fix_alpha_pips"] + df["carry_pips"] + df["hedge_cost_pips"]
 
-        # 6. Residual
-        df["residual_pips"] = (
+        # 6. Markout drift: whatever the realized markout still contains
+        #    after the four modeled components are subtracted. By the
+        #    additive identity this is exact — it is NOT model error, it
+        #    is the unmodeled mid-price drift the tape actually delivered.
+        df["markout_drift_pips"] = (
             df["total_pnl_pips"]
             - df["edge_pips"]
             - df["fix_alpha_pips"]
             - df["carry_pips"]
             - df["hedge_cost_pips"]
         )
+        # Keep the legacy column name as an alias so downstream callers
+        # (plots, tests) don't break.
+        df["residual_pips"] = df["markout_drift_pips"]
 
         return df
 

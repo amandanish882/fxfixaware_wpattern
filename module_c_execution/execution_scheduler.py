@@ -18,6 +18,8 @@ from typing import Dict, List
 
 import numpy as np
 
+from module_c_execution.vwap_calibration import calibrate_vwap_profile_24h
+
 # ---------------------------------------------------------------------------
 # Slice container
 # ---------------------------------------------------------------------------
@@ -48,36 +50,45 @@ class ExecutionSlice:
 # ---------------------------------------------------------------------------
 # CME FX intraday volume profile (UTC hours 0-23)
 # ---------------------------------------------------------------------------
+# Legacy hardcoded fallback used only if MBP-10 calibration produces no data.
+# The live profile is computed from cached CME MBP-10 deep-book parquets via
+# ``vwap_calibration.calibrate_vwap_profile_24h`` (see that module for the
+# 13:00-17:00 UTC real-data window and merge logic).
+_LEGACY_FX_VOLUME_PROFILE_24H = np.array(
+    [
+        # 00  01  02  03  04  05  06  07  08  09  10  11
+        0.03, 0.02, 0.02, 0.03, 0.04, 0.05, 0.10, 0.60, 0.85, 0.75, 0.65, 0.60,
+        # 12  13  14  15  16  17  18  19  20  21  22  23
+        0.70, 0.90, 1.00, 0.95, 0.80, 0.50, 0.30, 0.20, 0.15, 0.10, 0.05, 0.03,
+    ],
+    dtype=np.float64,
+)
+_LEGACY_FX_VOLUME_PROFILE_24H = (
+    _LEGACY_FX_VOLUME_PROFILE_24H / _LEGACY_FX_VOLUME_PROFILE_24H.sum()
+)
+
+
 def _fx_volume_profile_24h() -> np.ndarray:
     """Return a 24-element array of relative volume weights by UTC hour.
 
-    The profile captures the well-known FX futures intraday pattern:
-
-    - **Asian session (22:00-06:00 UTC)**: thin liquidity, ~2-5% of peak.
-      For example hour 3 (03:00 UTC / Tokyo afternoon) gets weight 0.03.
-    - **European open (07:00-09:00 UTC)**: sharp ramp as London desks come
-      online.  Hour 8 gets weight 0.85.
-    - **London / NY overlap (13:00-15:00 UTC)**: peak liquidity, weights
-      0.90-1.00.  This is when CME electronic volume is heaviest.
-    - **London fix (15:45-16:15 UTC)**: secondary spike at hour 16, weight
-      0.80.
-    - **NY afternoon (17:00-21:00 UTC)**: gradual taper to ~0.15.
+    The profile is calibrated from cached CME MBP-10 deep-book parquets
+    (13:00-17:00 UTC real-data window), with the remainder of the day
+    filled in from a U-shaped expert curve and the whole curve normalised
+    to integrate to 1.0.  If no cached data is available, the legacy
+    hardcoded profile is returned as a fallback.
 
     Returns
     -------
     np.ndarray
         Shape (24,), normalised so that the values sum to 1.0.
     """
-    raw = np.array(
-        [
-            # 00  01  02  03  04  05  06  07  08  09  10  11
-            0.03, 0.02, 0.02, 0.03, 0.04, 0.05, 0.10, 0.60, 0.85, 0.75, 0.65, 0.60,
-            # 12  13  14  15  16  17  18  19  20  21  22  23
-            0.70, 0.90, 1.00, 0.95, 0.80, 0.50, 0.30, 0.20, 0.15, 0.10, 0.05, 0.03,
-        ],
-        dtype=np.float64,
-    )
-    return raw / raw.sum()
+    try:
+        profile = calibrate_vwap_profile_24h()
+    except Exception:
+        profile = None
+    if profile is None or len(profile) != 24 or not np.isfinite(profile).all() or profile.sum() <= 0:
+        return _LEGACY_FX_VOLUME_PROFILE_24H.copy()
+    return profile / profile.sum()
 
 
 # ---------------------------------------------------------------------------

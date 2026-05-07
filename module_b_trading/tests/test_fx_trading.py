@@ -42,6 +42,41 @@ except ImportError:
 
 
 # ===================================================================
+# Calibrated daily-vol-pips tests (CME 15m cache)
+# ===================================================================
+def test_default_daily_vol_pips_uses_calibration_when_cache_present():
+    """When the CME 15m cache exists, DEFAULT_DAILY_VOL_PIPS should differ from
+    pure hardcoded fallbacks for at least some pairs."""
+    from pathlib import Path
+    cache = Path(__file__).resolve().parent.parent.parent / "data" / "cme_15m_cache.parquet"
+    if not cache.exists():
+        import pytest
+        pytest.skip("CME 15m cache not present; skipping calibration check")
+    from module_b_trading.markout_pnl import DEFAULT_DAILY_VOL_PIPS, _HARDCODED_DAILY_VOL_PIPS
+    # At least one pair should have a calibrated (non-hardcoded) value
+    diffs = sum(1 for k in DEFAULT_DAILY_VOL_PIPS if DEFAULT_DAILY_VOL_PIPS[k] != _HARDCODED_DAILY_VOL_PIPS.get(k))
+    assert diffs >= 1, f"expected calibration to change at least one pair; got {DEFAULT_DAILY_VOL_PIPS}"
+    # Each value must be positive and finite
+    for pair, v in DEFAULT_DAILY_VOL_PIPS.items():
+        assert v > 0 and v < 1000
+
+
+def test_calibrate_daily_vol_returns_dict_with_g4_pairs():
+    """Direct call returns dict keyed by G4 pair labels."""
+    from pathlib import Path
+    cache = Path(__file__).resolve().parent.parent.parent / "data" / "cme_15m_cache.parquet"
+    if not cache.exists():
+        import pytest
+        pytest.skip("CME 15m cache not present")
+    from module_b_trading.markout_pnl import _calibrate_daily_vol_pips
+    out = _calibrate_daily_vol_pips()
+    assert len(out) >= 2
+    for pair in out:
+        assert "/" in pair
+        assert out[pair] > 0
+
+
+# ===================================================================
 # Helper: Flat-rate curve adapter (wraps a flat rate as a .discount() object)
 # ===================================================================
 class FlatCurve:

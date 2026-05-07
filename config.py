@@ -3,6 +3,8 @@ FX Fix-Aware Market Making: W-Shaped Pattern (Krohn, Mueller & Whelan, JoF 2024)
 Central configuration module.
 """
 
+from __future__ import annotations
+
 import os
 import logging
 from pathlib import Path
@@ -119,6 +121,6 @@ def setup_logging(name: str = "") -> logging.Logger:
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-DEFAULT_VALUATION_DATE = "2026-03-05"
+DEFAULT_VALUATION_DATE = "2026-04-28"
 DEFAULT_CACHE_TTL_HOURS = 24
 BUMP_SIZE_BPS = 1

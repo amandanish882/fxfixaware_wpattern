@@ -1,10 +1,12 @@
 """
-Debug build script for fx_pricing_kernel C++ extension.
+Debug build script for fx_pricing_kernel C++ extension (Windows / MSVC).
 
 Usage:
     python setup_debug.py build_ext --inplace
 
-Builds with debug symbols, no optimization, and assertions enabled.
+For macOS / clang debug builds, see setup_debug_mac.py.
+
+Builds with debug symbols (/Zi), no optimization (/Od), assertions enabled.
 Attach Visual Studio debugger to the Python process to set breakpoints
 in curve_engine.h, fx_pricer.h, execution_engine.h.
 """

@@ -1,0 +1,375 @@
+
+======================================================================
+  STEP 0: Infrastructure
+  (KDB+ Startup, Databento CME FX Futures Tick Data -> KDB+)
+======================================================================
+
+-- 0a: KDB+ Server --
+  KDB+ already running at localhost:5001
+
+-- 0b: Create KDB+ Tables --
+  Tables created: {'fx_rates': 0, 'fx_rfqs': 0, 'fx_fills': 0, 'tick_data': 0}
+
+-- 0c: Load MBP-10 Tick Data (2026-03-18) --
+  Loaded 57604 total tick rows from Databento cache
+  Cache dir: /Users/amand/Library/CloudStorage/OneDrive-Personal/Quant 300/Projects 12 Feb/fx project/data/databento_cache
+  Sampled 4000 snapshots for KDB+ (from 57604 total)
+  Inserting into KDB+ tick_data table...
+  KDB+ tick_data: 4000 rows loaded
+    6E: 1000 snapshots
+    6B: 1000 snapshots
+    6J: 1000 snapshots
+    6A: 1000 snapshots
+
+======================================================================
+  STEP 1: FX Curve Construction
+  (USD OIS, EUR/GBP OIS Proxies, FX Forwards via CIP)
+======================================================================
+
+-- 1a: FX Spot Rates --
+  FX Spot Rates (as of 2026-04-28):
+    EUR/USD: 1.1715
+    GBP/USD: 1.3513
+    JPY/USD: 0.0063
+    AUD/USD: 0.7181
+
+-- 1b: USD OIS Curve (SOFR SR3 strip via Databento) --
+  Curve built: 11 nodes, max tenor = 2.13Y
+  Strip rows: 8 (front + back contracts) | Build time: 0.71 ms
+  Overnight anchor: 3.6400% from FRED SOFR fixing
+  Instruments derived from strip: 9 deposits (1 overnight + 8 at SR3 reference-period ends)
+
+  Key USD rates (SOFR):
+    0.5Y zero: 3.645%  |  D(0.5): 0.981940
+    1Y zero: 3.647%  |  D(1): 0.964191
+    2Y zero: 3.645%  |  D(2): 0.929692
+    5Y zero: -- (beyond strip max tenor 2.13Y)
+
+-- 1c: Monotone Convex vs Log-Linear --
+
+  Tenor     LogLin Zero  MonConv Zero  Diff (bps)  |   LogLin Fwd  MonConv Fwd  Diff (bps)
+  -----------------------------------------------------------------------------------------------
+    0.5         3.6449%       3.6450%      +0.01  |      3.6434%      3.6428%      -0.07
+    1.0         3.6465%       3.6466%      +0.00  |      3.6533%      3.6556%      +0.22
+    2.0         3.6451%       3.6455%      +0.04  |      3.6236%      3.6193%      -0.43
+    3.0         3.6379%       3.6438%      +0.58  |      3.6236%      3.6438%      +2.02
+    5.0         3.6322%       3.6438%      +1.16  |      3.6236%      3.6438%      +2.02
+    7.0         3.6297%       3.6438%      +1.40  |      3.6236%      3.6438%      +2.02
+    10.0        3.6279%       3.6438%      +1.59  |      3.6236%      3.6438%      +2.02
+    20.0        3.6257%       3.6438%      +1.80  |      3.6236%      3.6438%      +2.02
+  Plot saved: output/interpolation_comparison.png
+  Plot saved: output/zero_discount_curves.png
+
+-- 1d: FX Forward Curves (Covered Interest Parity) --
+  EUR/USD curve: REAL FUTURES (14 contracts: FST3=8 / FEMP=6)
+  GBP/USD curve: REAL FUTURES (8 contracts: SO3=8)
+  JPY/USD curve: REAL FUTURES (20 contracts: TY=20)
+  AUD/USD curve: REAL FUTURES + F2 LONG-END (18 IB contracts + 4 F2-derived nodes)
+
+  Pair           Spot     1M Fwd     3M Fwd     1Y Fwd  1Y Pts (pips)
+  ------------------------------------------------------------
+    EUR/USD      1.1715     1.1732     1.1765     1.1915        +200.1
+    GBP/USD      1.3513     1.3512     1.3510     1.3501         -11.9
+    JPY/USD      0.0063     0.0063     0.0063     0.0064          +0.0
+    AUD/USD      0.7181     0.7177     0.7168     0.7114         -66.6
+
+-- 1e: Cross-Currency Basis (CIP Deviations) --
+    EUR/USD (REAL): 2M: -5.7  5M: -26.6  8M: -35.1  11M: -48.5  1Y: -67.0
+    GBP/USD (REAL): 2M: +63.1  5M: -12.8  8M: -54.3  11M: -36.2  1Y: -42.5
+    JPY/USD (REAL): 2M: -6.2  5M: +2.5  8M: +1.6  11M: +3.7  1Y: +7.9
+    AUD/USD (REAL): 2M: +64.8  5M: -46.5  8M: +10.2  11M: +0.2  1Y: -11.3
+
+-- 1f: FX Swap Mechanics --
+  USD/JPY 3M (textbook): F=148.42, points=-158 pips (JPY at premium)
+
+  Live G4 swap points (real curves):
+  Pair             Spot     3M Fwd     3M Pts
+  EUR/USD        1.1715     1.1765     +49.8
+  GBP/USD        1.3513     1.3510      -2.9
+  JPY/USD        0.0063     0.0063      +0.0
+  AUD/USD        0.7181     0.7168     -12.6
+
+  USD/JPY T/N roll: -1.75 pips (1-day USD-funding cost)
+  USD/JPY 1W swap, year-end window: -159.4 pips (vs base -157.6)
+
+  Cross-currency basis term structure (bps, CME-derived at IMM tenors):
+  EUR/USD    2M:   -5.72   5M:  -26.57   8M:  -35.11   11M:  -48.52   1Y:  -66.99
+  GBP/USD    2M:  +63.10   5M:  -12.77   8M:  -54.29   11M:  -36.20   1Y:  -42.46
+  JPY/USD    2M:   -6.22   5M:   +2.49   8M:   +1.64   11M:   +3.67   1Y:   +7.93
+  AUD/USD    2M:  +64.82   5M:  -46.50   8M:  +10.23   11M:   +0.17   1Y:  -11.29
+
+-- 1g: Pipeline Visualizations --
+  Plot saved: output/foreign_ois_curves.png
+  Plot saved: output/xccy_basis_surface.png
+  Plot saved: output/forward_points_heatmap.png
+
+======================================================================
+  STEP 2: FX Pricing & Risk
+  (FX Swap Portfolio, Spot Delta, Cross-Gamma, Scenarios, VaR)
+======================================================================
+
+-- 2a: FX Swap Portfolio Pricing (CME-quoted forwards) --
+  Swap                                     NPV (USD)    Fwd Mkt    Fwd CIP        Src   Δ(bps)
+  ===========================================================================================
+  BUY 10MM EUR 1.00Y                       48,210     1.1846     1.1915        CME   -58.08
+  SELL 5MM GBP 0.50Y                        9,819     1.3482     1.3507        CME   -18.42
+  BUY 500MM JPY 1.00Y                      -31,070     0.0064     0.0064        CME    +5.96
+  BUY 8MM AUD 0.25Y                       23,782     0.7166     0.7168        CME    -3.80
+  ===========================================================================================
+  TOTAL PORTFOLIO NPV                         50,742
+  Δ(bps) = (Fwd_CME / Fwd_CIP − 1) × 1e4. Sign of Δ is the cross-currency basis priced into the
+  futures relative to the OIS-derived CIP forward. Source legend: CME=interp between IMMs,
+  CME-stub=spot→first-IMM front stub, CIP=fallback for T beyond cached grid.
+
+-- 2b: Risk (Spot Delta, Rate Delta, Tenor-Matched Hedge) --
+  Swap                           Spot Delta (USD)   Hedge Contract     #
+  ----------------------------------------------------------------------
+  BUY 10MM EUR 1.00Y                    114,884             6EH7 -  65
+  SELL 5MM GBP 0.50Y                    -66,316             6BU6 +  58
+  BUY 500MM JPY 1.00Y                     31,051             6JH7 -6219
+  BUY 8MM AUD 0.25Y                     56,826             6AM6 - 110
+
+-- 2c: Cross-Pair Correlation Matrix (517d realized) --
+         EUR/USD  GBP/USD  JPY/USD  AUD/USD
+EUR/USD    1.000    0.802    0.599    0.620
+GBP/USD    0.802    1.000    0.514    0.674
+JPY/USD    0.599    0.514    1.000    0.314
+AUD/USD    0.620    0.674    0.314    1.000
+
+-- 2d: Parametric VaR (99%, 1-day) --
+  Realized annualised vols: EUR/USD=7.2%, GBP/USD=7.1%, JPY/USD=10.0%, AUD/USD=9.7%
+  Portfolio 1-day 99% VaR: $157,646
+  Plot saved: output/fx_delta_ladder.png
+
+======================================================================
+  STEP 3: Fix Alpha Signals & Quoting
+  (W-Shaped Fix Pattern, Carry/Momentum/MR, Win Model, Optimizer)
+======================================================================
+
+-- 3a: W-Shaped Fix Pattern (Krohn, Mueller & Whelan 2024) --
+  REAL CME DATA: 1961 15-min observations (~63 days from CME futures)
+
+  W-Pattern Summary (EUR/USD, returns in bps around fixes):
+
+  Fix        Window            Mean (bps)   t-stat   n_days
+  ----------------------------------------------------------
+    london     [-60,-30]             -3.19   -2.41       62
+    london     [-30,-15]             -0.23   -0.32       61
+    london     [-15,0]               +0.63   +0.88       61
+    london     [0,+15]               -0.58   -0.98       61
+    london     [+15,+30]             +1.82   +2.99       61
+    london     [+30,+60]             +0.33   +0.68       61
+
+  Key finding: Pre-fix returns are NEGATIVE (USD appreciation)
+  Post-fix returns are POSITIVE (USD depreciation) = the W-shape
+  Plot saved: output/w_shape_pattern.png
+  Plot saved: output/w_shape_pattern_g4.png (4-panel small multiples)
+
+-- 3b: Composite Alpha Signals (Fix + Carry + Momentum + MR) --
+  Signals at 15:30 UTC (30min before London fix):
+    fix_signal: +0.5000
+    carry_signal: +0.0000
+    momentum_signal: +0.0000
+    mean_reversion_signal: +0.0000
+    composite_raw: +0.2500
+    composite_skew_pips: +0.7500
+    fix_schedule.spread_multiplier: +0.8500
+    fix_schedule.skew_direction: +1.0000
+    fix_schedule.minutes_to_fix: +30.0000
+    fix_schedule.adverse_selection_risk: +0.2500
+
+-- 3c: Win Probability Model --
+  RFQ date range: 2026-03-13 -> 2026-05-07 (overlaps with yfinance 1h data)
+  Win Model: AUC=0.785, Accuracy=0.718
+
+  Decile Calibration (predicted vs actual hit rate):
+    Bucket          Predicted     Actual    Count
+    --------------------------------------------
+    [0.0, 0.1)          0.061      0.046      239
+    [0.1, 0.2)          0.150      0.150      300
+    [0.2, 0.3)          0.250      0.263      293
+    [0.3, 0.4)          0.347      0.358      254
+    [0.4, 0.5)          0.450      0.421      221
+    [0.5, 0.6)          0.548      0.559      213
+    [0.6, 0.7)          0.651      0.663      258
+    [0.7, 0.8)          0.745      0.725      193
+    [0.8, 0.9)          0.815      0.897       29
+  Brier Score: 0.1843
+  AUC: 0.779
+
+  Drift Detection:
+    Max Feature PSI: 0.0188  (stable)
+    Recommendation: stable
+
+-- 3d: Fix-Aware Quote Optimizer (with directional alpha) --
+  Direction-aware quoting (sample RFQ across three regimes):
+    Pre-fix (15:30 UTC):   alpha=+0.75p  spread=2.80p  P(hit)=40.1%  E[α PnL]=+0.150p
+    At-fix (16:01 UTC):    alpha=+0.00p  spread=5.70p  P(hit)=37.5%  E[α PnL]=+0.000p
+    Off-fix (10:00 UTC):   alpha=+0.00p  spread=3.00p  P(hit)=37.5%  E[α PnL]=+0.000p
+    Pre-fix guardrails:  []
+    At-fix guardrails:   ['fix_window_widening']
+
+  Per-RFQ alpha summary: mean=+0.185p  std=0.374p  min=+0.00p  max=+1.12p  |alpha|>0.5p: 12/100
+
+  Backtest Results (100 RFQs):
+    Total E[PnL]:                 60.12 pips
+    Total realized PnL:           93.07 pips
+    Avg optimal spread:           2.590 pips
+    Avg P(hit):                   23.8%
+    Guardrails triggered:         1/100
+
+  Value of the W-shape signal:
+    Alpha-aware E[PnL]:           60.12 pips
+    Alpha-blind E[PnL] under true drift: 59.84 pips
+    Value-of-information lift:    +0.28 pips E[PnL]; +2.20 pips realized
+    Favorable RFQs (7/100): captured  +1.03 pips of edge
+    Adverse RFQs   (15/100): avoided   +0.38 pips of toxic flow
+
+  Optimizer vs Flat 1.0 pip:
+    Optimizer E[PnL]: 60.12 pips, Flat E[PnL]: 48.40 pips
+    Improvement: +11.72 pips (-0.3193 hit rate)
+
+======================================================================
+  STEP 4: Hedge Sizing & Market Impact
+  (Delta Hedge -> CME FX Futures, Almgren-Chriss Cost Model)
+======================================================================
+
+-- 4a: Delta Hedge Sizing --
+
+  Swap                            Delta (USD)  Futures  Contracts  Direction
+  ---------------------------------------------------------------------------
+  BUY 10MM EUR 1.00Y                  114,884       6E        +65        BUY
+  SELL 5MM GBP 0.50Y                  -66,316       6B        +58        BUY
+  BUY 500MM JPY 1.00Y                   31,051       6J      +6219        BUY
+  BUY 8MM AUD 0.25Y                   56,826       6A       +110        BUY
+
+-- 4b: Market Impact (Almgren-Chriss) --
+
+  Ticker  Contracts  Perm (pips)  Temp (pips)  Cost (pips)    Horizon
+  -----------------------------------------------------------------
+  6E             65       0.0005       0.3586       0.3591      1.0m
+  6B             58       0.0009       0.6984       0.6993      1.0m
+  6J           6219       0.0031       2.4416       2.4447      1.0m
+  6A            110       0.0010       0.7830       0.7840      1.0m
+
+  Reference: 200 contracts per ticker
+  Ticker  Contracts  Perm (pips)  Temp (pips)  Cost (pips)    Horizon
+  -----------------------------------------------------------------
+  6E            200       0.0014       1.1034       1.1048      1.0m
+  6B            200       0.0031       2.4082       2.4113      1.0m
+  6J            200       0.0001       0.0785       0.0786      1.0m
+  6A            200       0.0018       1.4237       1.4255      1.0m
+
+======================================================================
+  STEP 5: Execution
+  (TWAP/VWAP/Adaptive Strategies, L2 Slippage Backtest via KDB+)
+======================================================================
+
+-- 5a: Execution Strategy Comparison (per hedge leg from Step 4) --
+
+  EUR/USD -> BUY 65 6E:
+  Strategy        First 3     Last 3      Max
+  ------------------------------------------
+  TWAP               15.0       15.0      5.0
+  VWAP                4.2 30.563899999999997  12.9441
+  Adaptive     3.5629999999999997    28.6401   10.814
+
+  GBP/USD -> BUY 58 6B:
+  Strategy        First 3     Last 3      Max
+  ------------------------------------------
+  TWAP            13.3845    13.3845   4.4615
+  VWAP         3.7476000000000003    27.2725  11.5502
+  Adaptive     3.1794000000000002    25.5558   9.6494
+
+  JPY/USD -> BUY 6219 6J:
+  Strategy        First 3     Last 3      Max
+  ------------------------------------------
+  TWAP          1435.1538  1435.1538 478.3846
+  VWAP           401.8375  2924.2677 1238.4559
+  Adaptive     340.90470000000005  2740.1973 1034.6497
+
+  AUD/USD -> BUY 110 6A:
+  Strategy        First 3     Last 3      Max
+  ------------------------------------------
+  TWAP         25.384499999999996 25.384499999999996   8.4615
+  VWAP             7.1075    51.7237  21.9055
+  Adaptive         6.0299    48.4679  18.3006
+
+-- 5b: Slippage Backtest (L2 via KDB+) --
+  KDB+ tick_data: 4000 rows -- using L2 book-walking
+
+  Per-hedge-leg L2 slippage (real book depth, 3 strategies):
+  Pair       Ticker  Contracts Strategy      Slippage (pips)
+  ----------------------------------------------------------
+  EUR/USD    6E             65 TWAP                  0.3796
+  EUR/USD    6E             65 VWAP                  0.3891
+  EUR/USD    6E             65 Adaptive              0.3775
+  GBP/USD    6B             58 TWAP                  0.8048
+  GBP/USD    6B             58 VWAP                  0.8210
+  GBP/USD    6B             58 Adaptive              0.8052
+  JPY/USD    6J           6219 TWAP                  2.5315
+  JPY/USD    6J           6219 VWAP                  2.5483
+  JPY/USD    6J           6219 Adaptive              2.5662
+  AUD/USD    6A            110 TWAP                  0.7578
+  AUD/USD    6A            110 VWAP                  0.7420
+  AUD/USD    6A            110 Adaptive              0.7642
+
+  Predicted (Almgren-Chriss) vs Realised (TWAP L2 book walk):
+  Pair       Ticker    AC pred    TWAP real   Diff (pips)
+  -------------------------------------------------------
+  EUR/USD    6E         0.3591       0.3796       +0.0205
+  GBP/USD    6B         0.6993       0.8048       +0.1055
+  JPY/USD    6J         2.4447       2.5315       +0.0868
+  AUD/USD    6A         0.7840       0.7578       -0.0262
+
+-- 5c: Execution Analysis Charts (6E) --
+  Plot saved: output/execution_analysis.png
+
+======================================================================
+  STEP 6: P&L Analysis
+  (Fix-Conditioned Markouts, P&L Decomposition)
+======================================================================
+
+-- 6a: Markout Analysis --
+  Hedge-cost source per pair (used in markout P&L):
+    EUR/USD: 0.3796 pips  (L2 TWAP realised)
+    GBP/USD: 0.8048 pips  (L2 TWAP realised)
+    JPY/USD: 2.5315 pips  (L2 TWAP realised)
+    AUD/USD: 0.7578 pips  (L2 TWAP realised)
+
+  Markout Summary (773 filled trades):
+    Horizon       Mean (pips)     Median        Std
+    ------------------------------------------------
+    1-min             +5.041     +2.192    125.680
+    5-min             +4.932     +2.163    125.835
+    30-min            +4.739     +1.766    125.409
+    1-hour            +5.005     +2.044    125.306
+    1-day             +4.444     +2.045    123.001
+
+-- 6b: Markouts by Fix Proximity (Key Result) --
+
+  Proximity      markout_1m   markout_5m  markout_30m   markout_1h   markout_1d
+  ------------------------------------------------------------
+    pre_fix          +16.491     +16.043     +15.374     +16.153     +11.910
+    at_fix           -15.887     -15.887     -15.887     -18.224     -13.591
+    post_fix          -6.157      -6.157      -6.608      -4.886      +5.698
+    neutral           +3.664      +3.631      +3.588      +3.622      +2.736
+
+  Expected: Pre-fix fills show BETTER markouts (trading with the fix drift)
+  At-fix fills show WORSE markouts (adverse selection from fix order flow)
+
+-- 6c: P&L Decomposition --
+
+  773 filled trades:
+    Mean P&L:        +4.739 pips
+    Median P&L:      +1.766 pips
+    Std Dev:         125.409 pips
+    % Profitable:    52.4%
+    Sharpe (ann):    1.05
+    Mean edge_pips             : +0.617 pips
+    Mean fix_alpha_pips        : +0.052 pips
+    Mean carry_pips            : +0.009 pips
+    Mean hedge_cost_pips       : -0.920 pips
+    Mean markout_drift_pips    : +4.980 pips
+
+[Snapshot truncated at end of Step 6. Steps 7-9 require the optional C++ kernel build; the Python pipeline is fully demonstrated through Step 6.]

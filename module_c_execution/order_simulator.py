@@ -2,10 +2,11 @@
 L2 order-book walking simulator and strategy backtester for CME FX futures.
 
 Simulates filling block orders by walking through Level-2 book depth,
-and backtests TWAP/VWAP/Adaptive strategies against either live KDB+
-snapshots or synthetic book data with realistic FX depth characteristics.
+and backtests TWAP/VWAP/Adaptive strategies. Primary data source is live
+KDB+ snapshots fed from real Databento MBP-10; a synthetic L2 book
+generator is used only as a fallback when KDB+ is unavailable.
 
-Synthetic books model:
+Synthetic-book fallback model:
 - L1 spread: 0.5-1 tick (tight for liquid FX futures)
 - L2-L5: spread widens ~0.5 tick per level
 - Size: exponential decay from L1 (largest) to L10 (smallest)
@@ -344,7 +345,7 @@ class OrderSimulator:
         use_l2: bool = True,
         kdb_host: str = "localhost",
         kdb_port: int = 5001,
-        date_str: str = "2026-03-05",
+        date_str: str = "2026-04-28",
         start_time: str = "09:30",
         end_time: str = "16:00",
     ) -> Dict[str, Dict[str, float]]:
@@ -371,7 +372,7 @@ class OrderSimulator:
         kdb_port : int
             KDB+ port.  Default ``5001``.
         date_str : str
-            Date for historical backtest.  Default ``"2026-03-05"``.
+            Date for historical backtest.  Default ``"2026-04-28"``.
         start_time : str
             Session start in ``"HH:MM"``.  Default ``"09:30"``.
         end_time : str

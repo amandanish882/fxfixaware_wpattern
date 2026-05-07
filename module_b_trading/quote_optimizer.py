@@ -81,34 +81,37 @@ class FXQuoteOptimizer:
         current_utc_time: Optional[datetime] = None,
         alpha_skew_pips: float = 0.0,
     ) -> Dict[str, Any]:
-        """Find the optimal spread for an RFQ via grid search.
+        """Find the optimal asymmetric quote for an RFQ.
 
-        Grid: 100 spreads from 0.1 to 5.0 pips.
-        For each spread s:
-            1. Set the spread in rfq_features
-            2. Predict P(hit|s)
-            3. Compute E[PnL] = P(hit) * (s - cost) - lambda * delta^2 + fix_adj
-            4. Pick the spread that maximizes E[PnL]
+        E[PnL] objective:
+            E[PnL] = P(hit|s) * (s - hedge_cost + alpha_per_trade)
+                    - lambda * delta^2 + regime_boost
 
-        Example at 15:45 UTC (pre-London fix):
-            Grid search finds optimal at s=0.72 pips:
-            P(hit|0.72) = 0.78, cost = 0.10, fix_adj = +0.05 (tighten pre-fix)
-            E[PnL] = 0.78 * (0.72 - 0.10) + 0.05 = 0.533 pips
+        where alpha_per_trade = (signed) alpha_skew_pips * proximity_factor,
+        oriented to the RFQ direction so positive = filling is alpha-favorable.
 
-        Parameters
-        ----------
-        rfq_features : pd.DataFrame
-            Single-row (or multi-row) DataFrame with RFQ features.
-            Must have: timestamp, pair, client_segment, notional_usd, quoted_spread_pips.
-        current_utc_time : datetime, optional
-            Override UTC time for fix schedule. Defaults to timestamp in data.
-        alpha_skew_pips : float
-            Additional skew from composite alpha model (positive = tighten bid).
+        Convention for ``alpha_skew_pips``:
+            Signed directional view in pips (positive = USD up = base down).
+            Per-RFQ favorability is derived from the RFQ ``direction`` field:
+            ``buy_base`` (client takes base, gives us USD) is favorable when
+            alpha > 0; ``sell_base`` is favorable when alpha < 0.
 
         Returns
         -------
-        dict
-            optimal_spread_pips, expected_pnl, hit_prob, guardrails, fix_schedule.
+        dict with:
+            optimal_spread_pips     : chosen half-spread (pips). Already
+                                      direction-adjusted via per-trade alpha:
+                                      tighter on alpha-favorable RFQs,
+                                      wider on alpha-adverse.
+            expected_pnl            : E[PnL] at the chosen spread (pips)
+            expected_alpha_pnl_pips : alpha contribution to E[PnL] (pips)
+            hit_prob                : P(hit) at chosen spread
+            guardrails              : list of triggered guardrails
+            fix_schedule            : fix-timing dict
+            hedge_cost_pips         : assumed hedging cost
+            alpha_skew_pips         : echoed input directional view
+            alpha_per_trade_pips    : proximity-scaled, RFQ-direction-signed
+                                      per-trade alpha (pips)
         """
         # Work with first row if multi-row
         row = rfq_features.iloc[0] if len(rfq_features) > 0 else rfq_features
@@ -126,8 +129,15 @@ class FXQuoteOptimizer:
 
         fix_sched = self.fix_alpha.fix_schedule(current_utc_time)
 
-        # Fix adjustment to E[PnL]
-        fix_adj = self._fix_adjustment(fix_sched, alpha_skew_pips)
+        # Per-RFQ favorability: flip sign for sell_base (the client gives us base,
+        # so a "USD up" view is unfavorable for accumulating that direction).
+        rfq_direction = str(row.get("direction", "buy_base"))
+        rfq_sign = +1.0 if rfq_direction == "buy_base" else -1.0
+        proximity_factor = self._alpha_proximity_factor(fix_sched)
+        alpha_per_trade = alpha_skew_pips * rfq_sign * proximity_factor
+
+        # Regime boost: small constant edge in pre/post-fix; widening cost at-fix
+        regime_boost = self._regime_boost(fix_sched)
 
         # Delta penalty (notional-based)
         delta_penalty = self.lambda_risk * (notional ** 2) * 1e-14  # scale to pips
@@ -159,8 +169,8 @@ class FXQuoteOptimizer:
         logits = base_logit + spread_coef * (spread_grid - base_spread)
         probs = 1.0 / (1.0 + np.exp(-logits))
 
-        # Vectorized E[PnL]
-        epnls = probs * (spread_grid - hedge_cost) - delta_penalty + fix_adj
+        # Vectorized E[PnL]: alpha enters per-fill revenue (multiplied by hit prob)
+        epnls = probs * (spread_grid - hedge_cost + alpha_per_trade) - delta_penalty + regime_boost
 
         best_idx = np.argmax(epnls)
         best_spread = spread_grid[best_idx]
@@ -169,58 +179,65 @@ class FXQuoteOptimizer:
 
         # Apply guardrails
         guardrails = self._check_guardrails(best_spread, notional, best_prob, fix_sched)
-
-        # Enforce guardrails
         if "fix_window_widening" in guardrails:
             best_spread = max(best_spread, best_spread * fix_sched["spread_multiplier"])
         if "min_spread_breach" in guardrails:
             best_spread = max(best_spread, self.MIN_SPREAD_PIPS)
 
         return {
-            "optimal_spread_pips": round(best_spread, 3),
-            "expected_pnl": round(best_epnl, 4),
-            "hit_prob": round(best_prob, 4),
+            "optimal_spread_pips": round(float(best_spread), 3),
+            "expected_pnl": round(float(best_epnl), 4),
+            "expected_alpha_pnl_pips": round(float(alpha_per_trade * best_prob), 4),
+            "hit_prob": round(float(best_prob), 4),
             "guardrails": guardrails,
             "fix_schedule": fix_sched,
             "hedge_cost_pips": hedge_cost,
-            "alpha_skew_pips": round(alpha_skew_pips, 3),
+            "alpha_skew_pips": round(float(alpha_skew_pips), 3),
+            "alpha_per_trade_pips": round(float(alpha_per_trade), 4),
         }
 
     # ------------------------------------------------------------------
     # Backtest
     # ------------------------------------------------------------------
 
-    def backtest(self, rfq_data: pd.DataFrame) -> Dict:
+    def backtest(
+        self,
+        rfq_data: pd.DataFrame,
+        alpha_skew_pips: Optional[Any] = None,
+        realized_alpha_pips: Optional[Any] = "same",
+    ) -> Dict:
         """Backtest the optimizer across a historical RFQ dataset.
-
-        For each RFQ:
-            1. Find optimal spread
-            2. Compare to actual outcome (was_hit)
-            3. Compute realized P&L
-
-        Example output:
-            {
-                'total_expected_pnl': 4250.5,   # pips across all RFQs
-                'avg_spread_pips': 0.92,
-                'avg_hit_prob': 0.68,
-                'n_rfqs': 10000,
-                'guardrails_count': {'fix_window_widening': 850, ...},
-            }
 
         Parameters
         ----------
         rfq_data : pd.DataFrame
-            Historical RFQ data with was_hit column.
+            Historical RFQ data with ``was_hit`` column. If ``timestamp`` and
+            ``direction`` columns are present they are used for fix-proximity
+            scaling and per-RFQ alpha sign.
+        alpha_skew_pips : float, np.ndarray, pd.Series, or None
+            Directional alpha view (in pips) the OPTIMIZER SEES — drives the
+            spread choice. ``None`` means the optimizer is alpha-blind.
+        realized_alpha_pips : same shapes, or ``"same"``, or ``None``
+            Directional alpha view used to EVALUATE the chosen spreads —
+            represents the *true* drift the world delivers. Default ``"same"``
+            mirrors the optimizer's view (the standard backtest). Pass the
+            true alpha here while leaving ``alpha_skew_pips=None`` to compute
+            "what an alpha-blind optimizer actually achieves under true drift",
+            i.e. the baseline for value-of-information lift.
 
         Returns
         -------
         dict
-            Backtest summary statistics.
+            Backtest summary, including:
+              - ``total_expected_pnl`` evaluated under realized alpha
+              - ``total_alpha_pnl`` directional contribution under realized alpha
+              - ``opt_spreads_per_rfq`` array of per-RFQ chosen spreads
         """
-        # Vectorized backtest: batch-predict once, then analytical grid per row
         n = len(rfq_data)
         if n == 0:
-            return {"total_expected_pnl": 0, "avg_spread": 0,
+            return {"total_expected_pnl": 0, "total_realized_pnl": 0,
+                    "total_alpha_pnl": 0,
+                    "avg_spread": 0,
                     "avg_hit_prob": 0, "n_rfqs": 0, "n_guardrails_triggered": 0}
 
         # Batch predict baseline probabilities for all RFQs at once
@@ -234,6 +251,26 @@ class FXQuoteOptimizer:
         pairs = rfq_data["pair"].values if "pair" in rfq_data.columns else np.full(n, "EUR/USD")
         notionals = rfq_data["notional_usd"].values if "notional_usd" in rfq_data.columns else np.full(n, 5e6)
         was_hits = rfq_data["was_hit"].values if "was_hit" in rfq_data.columns else np.zeros(n, dtype=bool)
+        directions = rfq_data["direction"].values if "direction" in rfq_data.columns else np.full(n, "buy_base")
+        timestamps = rfq_data["timestamp"].values if "timestamp" in rfq_data.columns else np.array([None] * n)
+
+        def _broadcast(x):
+            if x is None:
+                return np.zeros(n)
+            if np.isscalar(x):
+                return np.full(n, float(x))
+            arr = np.asarray(x, dtype=float)
+            return np.full(n, float(arr.item())) if arr.size == 1 else arr
+
+        # The optimizer SEES this alpha when picking spreads.
+        alpha_arr = _broadcast(alpha_skew_pips)
+        # The world DELIVERS this alpha when evaluating outcomes. Default = same.
+        if isinstance(realized_alpha_pips, str) and realized_alpha_pips == "same":
+            realized_arr = alpha_arr.copy()
+        else:
+            realized_arr = _broadcast(realized_alpha_pips)
+
+        rfq_signs = np.where(directions == "buy_base", 1.0, -1.0)
 
         # Get spread sensitivity
         spread_coef = -1.2
@@ -250,6 +287,7 @@ class FXQuoteOptimizer:
         spread_grid = np.linspace(0.1, 5.0, 50)
         opt_spreads = np.zeros(n)
         opt_epnls = np.zeros(n)
+        opt_alpha_epnls = np.zeros(n)
         opt_probs = np.zeros(n)
         guardrail_count = 0
 
@@ -257,33 +295,79 @@ class FXQuoteOptimizer:
             hedge_cost = self.HEDGE_COST_PIPS.get(pairs[i], 0.15)
             delta_pen = self.lambda_risk * (notionals[i] ** 2) * 1e-14
 
+            # Fix schedule + proximity factor for this RFQ
+            ts = timestamps[i]
+            if ts is None:
+                fix_sched = {"fix_proximity": "neutral", "minutes_to_fix": 999,
+                             "spread_multiplier": 1.0, "adverse_selection_risk": 0.1}
+            else:
+                if not isinstance(ts, datetime):
+                    ts = pd.Timestamp(ts).to_pydatetime()
+                fix_sched = self.fix_alpha.fix_schedule(ts)
+            proximity_factor = self._alpha_proximity_factor(fix_sched)
+            regime_boost = self._regime_boost(fix_sched)
+
+            chosen_alpha = alpha_arr[i] * rfq_signs[i] * proximity_factor
+            realized_alpha = realized_arr[i] * rfq_signs[i] * proximity_factor
+
             # Analytical P(hit) across grid
             bp = max(min(base_probs[i], 0.999), 0.001)
             base_logit = np.log(bp / (1 - bp))
             logits = base_logit + spread_coef * (spread_grid - base_spreads[i])
             probs = 1.0 / (1.0 + np.exp(-logits))
-            epnls = probs * (spread_grid - hedge_cost) - delta_pen
+            # Optimizer picks spread under the alpha it CAN SEE
+            epnls_chosen_view = probs * (spread_grid - hedge_cost + chosen_alpha) - delta_pen + regime_boost
 
-            best_idx = np.argmax(epnls)
-            opt_spreads[i] = spread_grid[best_idx]
-            opt_epnls[i] = epnls[best_idx]
-            opt_probs[i] = probs[best_idx]
+            best_idx = int(np.argmax(epnls_chosen_view))
+            best_spread = float(spread_grid[best_idx])
+            best_prob = float(probs[best_idx])
 
-            if opt_spreads[i] < self.MIN_SPREAD_PIPS:
+            # Guardrails
+            if fix_sched.get("fix_proximity") == "at_fix":
+                best_spread = max(best_spread, best_spread * fix_sched.get("spread_multiplier", 1.0))
                 guardrail_count += 1
+            if best_spread < self.MIN_SPREAD_PIPS:
+                best_spread = self.MIN_SPREAD_PIPS
 
-        realized_pnls = np.where(was_hits,
-                                  opt_spreads - np.array([self.HEDGE_COST_PIPS.get(p, 0.15) for p in pairs]),
-                                  0.0)
+            # Re-evaluate the chosen spread against the *realized* alpha for the
+            # honest E[PnL]. (When chosen=realized this collapses to the same
+            # number; when they differ this exposes information value.)
+            best_logit = base_logit + spread_coef * (best_spread - base_spreads[i])
+            best_prob_at_chosen = 1.0 / (1.0 + np.exp(-best_logit))
+            true_epnl = best_prob_at_chosen * (best_spread - hedge_cost + realized_alpha) - delta_pen + regime_boost
+
+            opt_spreads[i] = best_spread
+            opt_epnls[i] = float(true_epnl)
+            opt_alpha_epnls[i] = float(best_prob_at_chosen * realized_alpha)
+            opt_probs[i] = float(best_prob_at_chosen)
+
+        # Realized PnL: when a fill happens, the trader captures the quoted
+        # spread minus hedge cost, plus the realized alpha drift.
+        hedge_costs_arr = np.array([self.HEDGE_COST_PIPS.get(p, 0.15) for p in pairs])
+        proximity_factors = np.array([
+            self._alpha_proximity_factor(
+                self.fix_alpha.fix_schedule(
+                    pd.Timestamp(t).to_pydatetime() if t is not None else datetime(2000, 1, 1)
+                )
+            ) for t in timestamps
+        ])
+        realized_pnls = np.where(
+            was_hits,
+            opt_spreads - hedge_costs_arr + realized_arr * rfq_signs * proximity_factors,
+            0.0,
+        )
 
         return {
             "total_expected_pnl": round(float(opt_epnls.sum()), 2),
             "total_realized_pnl": round(float(realized_pnls.sum()), 2),
+            "total_alpha_pnl": round(float(opt_alpha_epnls.sum()), 2),
             "avg_spread": round(float(opt_spreads.mean()), 3),
             "avg_hit_prob": round(float(opt_probs.mean()), 4),
             "hit_rate_actual": round(float(was_hits.mean()), 4),
             "n_rfqs": n,
             "n_guardrails_triggered": guardrail_count,
+            "opt_spreads_per_rfq": opt_spreads.copy(),
+            "opt_alpha_epnls_per_rfq": opt_alpha_epnls.copy(),
         }
 
     # ------------------------------------------------------------------
@@ -291,7 +375,8 @@ class FXQuoteOptimizer:
     # ------------------------------------------------------------------
 
     def quote_vs_flat(self, rfq_data: pd.DataFrame,
-                      flat_spread_pips: float = 1.0) -> pd.DataFrame:
+                      flat_spread_pips: float = 1.0,
+                      alpha_skew_pips: Optional[Any] = None) -> pd.DataFrame:
         """Compare optimizer quotes vs a flat (constant) spread strategy.
 
         Example output:
@@ -312,8 +397,8 @@ class FXQuoteOptimizer:
         pd.DataFrame
             Comparison table between optimizer and flat strategy.
         """
-        # Optimizer backtest
-        opt_bt = self.backtest(rfq_data)
+        # Optimizer backtest (with directional alpha threaded in)
+        opt_bt = self.backtest(rfq_data, alpha_skew_pips=alpha_skew_pips)
 
         # Flat spread backtest — single batch predict
         flat_data = rfq_data.copy()
@@ -373,47 +458,42 @@ class FXQuoteOptimizer:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _fix_adjustment(self, fix_sched: Dict, alpha_skew_pips: float) -> float:
-        """Compute the fix-timing adjustment to expected P&L.
+    def _regime_boost(self, fix_sched: Dict) -> float:
+        """Constant E[PnL] adjustment from being inside a fix regime.
 
-        Pre-fix: positive adjustment (signal is profitable, tighten spread)
-        At-fix: negative adjustment (adverse selection, widen)
-        Post-fix: slight positive (reversal opportunity)
-
-        Example:
-            Pre-fix, 15 min out, alpha_skew = +1.2 pips
-            fix_adj = 0.05 + 0.3 * 1.2 * (1 - 15/60) = 0.05 + 0.27 = 0.32
-
-        Parameters
-        ----------
-        fix_sched : dict
-            From FixAlphaModel.fix_schedule().
-        alpha_skew_pips : float
-            Alpha skew signal in pips.
-
-        Returns
-        -------
-        float
-            P&L adjustment in pips.
+        Captures the non-alpha edge available to a fix-aware market maker:
+        a small bonus for being open during the alpha window (pre/post fix)
+        and a penalty for adverse selection at the fix print.
         """
         proximity = fix_sched.get("fix_proximity", "neutral")
         minutes = fix_sched.get("minutes_to_fix", 999)
 
         if proximity == "pre_fix":
-            # Pre-fix: we benefit from the drift, so tighten aggressively
-            time_factor = max(0, 1.0 - minutes / 60.0)
-            return 0.05 + 0.3 * abs(alpha_skew_pips) * time_factor
-
-        elif proximity == "at_fix":
-            # At fix: adverse selection is highest
+            time_factor = max(0.0, 1.0 - minutes / 60.0)
+            return 0.05 * time_factor
+        if proximity == "at_fix":
             return -0.2 * fix_sched.get("adverse_selection_risk", 0.8)
-
-        elif proximity == "post_fix":
-            # Post-fix: reversal opportunity, slight benefit
+        if proximity == "post_fix":
             return 0.02
+        return 0.0
 
-        else:
-            return 0.0
+    def _alpha_proximity_factor(self, fix_sched: Dict) -> float:
+        """How much of the alpha signal flows into per-trade E[PnL].
+
+        Strongest near the fix (signal is most reliable when concentrated
+        flow is imminent), suppressed at the fix print (adverse selection
+        dominates), small but non-zero outside fix windows.
+        """
+        proximity = fix_sched.get("fix_proximity", "neutral")
+        minutes = fix_sched.get("minutes_to_fix", 999)
+
+        if proximity == "pre_fix":
+            return max(0.3, 1.0 - minutes / 60.0)  # 0.3 -> 1.0 ramp
+        if proximity == "at_fix":
+            return 0.0  # adverse selection dominates; ignore directional view
+        if proximity == "post_fix":
+            return 0.5  # reversal partially captured
+        return 0.3  # always-on baseline (carry/momentum/MR still apply)
 
     def _check_guardrails(self, spread: float, notional: float,
                           hit_prob: float, fix_sched: Dict) -> list:

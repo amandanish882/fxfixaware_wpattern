@@ -44,11 +44,15 @@ class FXRiskAnalytics:
         Spot rates keyed by pair, e.g. {"EUR/USD": 1.0850, "GBP/USD": 1.2650}.
     """
 
-    def __init__(self, bootstrapper, instruments, valuation_date, fx_spots: Dict[str, float]):
+    def __init__(self, bootstrapper, instruments, valuation_date, fx_spots: Dict[str, float],
+                 futures_grids: Optional[Dict[str, pd.DataFrame]] = None):
         self.bootstrapper = bootstrapper
         self.instruments = instruments
         self.valuation_date = valuation_date
         self.fx_spots = fx_spots
+        # Optional per-pair CME IMM grids (output of `fetch_back_month_fx_curve`),
+        # consumed by `best_futures_hedge` for tenor-matched contract selection.
+        self.futures_grids = futures_grids or {}
 
     # ------------------------------------------------------------------
     # Spot delta via bump-and-revalue
@@ -256,9 +260,10 @@ class FXRiskAnalytics:
     # ------------------------------------------------------------------
 
     def correlation_matrix(self, returns_history: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-        """Estimate cross-pair correlation from trailing 252 daily returns.
+        """Cross-pair correlation matrix.
 
-        If no returns history is provided, uses realistic default correlations
+        If a returns_history DataFrame with >= 20 rows is supplied, returns
+        the empirical Pearson correlation. Otherwise falls back to defaults
         calibrated to major FX pairs.
 
         Example default matrix (approximate):
@@ -327,13 +332,17 @@ class FXRiskAnalytics:
         corr_mat = self.correlation_matrix(returns_history)
         pairs_in_portfolio = risk_df["pair"].tolist()
 
-        # Daily volatilities (annualized ~8-12% for majors -> daily ~0.5-0.75%)
+        # Daily vols: prefer realized from returns_history, else fall back to
+        # calibrated defaults (annualized ~8-12% for majors -> daily ~0.5-0.75%).
         default_daily_vols = {
-            "EUR/USD": 0.0055,   # ~8.7% annualized
-            "GBP/USD": 0.0065,   # ~10.3% annualized
-            "JPY/USD": 0.0060,   # ~9.5% annualized
-            "AUD/USD": 0.0070,   # ~11.1% annualized
+            "EUR/USD": 0.0055,
+            "GBP/USD": 0.0065,
+            "JPY/USD": 0.0060,
+            "AUD/USD": 0.0070,
         }
+        realized_vols = {}
+        if returns_history is not None and len(returns_history) >= 20:
+            realized_vols = returns_history.std().to_dict()
 
         n = len(pairs_in_portfolio)
         delta_vec = np.zeros(n)
@@ -343,9 +352,8 @@ class FXRiskAnalytics:
         for i, pair in enumerate(pairs_in_portfolio):
             delta_vec[i] = risk_df.loc[risk_df["pair"] == pair, "net_spot_delta"].values[0]
             spot = self.fx_spots.get(pair, 1.0)
-            # Convert delta from "per spot unit" to "per % move" using daily vol
-            daily_vol = default_daily_vols.get(pair, 0.006)
-            vol_vec[i] = daily_vol * spot  # daily spot move in absolute terms
+            daily_vol = realized_vols.get(pair, default_daily_vols.get(pair, 0.006))
+            vol_vec[i] = daily_vol * spot  # convert % vol to absolute daily move
 
             for j, pair_j in enumerate(pairs_in_portfolio):
                 if pair in corr_mat.index and pair_j in corr_mat.columns:
@@ -371,30 +379,26 @@ class FXRiskAnalytics:
     def best_futures_hedge(self, swap: FXSwapSpec) -> Dict[str, Any]:
         """Map an FX swap's spot delta to the best CME FX futures hedge.
 
-        Example:
-            10MM EUR/USD swap with spot_delta = 4,828,000 USD per spot point
-            6E contract = 125,000 EUR -> dollar value per contract = 125,000 * 1.0850 = 135,625
-            n_contracts = round(4,828,000 / 135,625) = round(35.6) = 36 contracts
-            direction = 'short' (to offset long delta)
+        If `futures_grids` was supplied at construction time, the contract
+        whose expiry is closest to the swap's maturity is selected (tenor
+        matching) — this kills roll risk and keeps the hedge's basis
+        sensitivity aligned with the swap's. Without a grid, the front-month
+        generic root is used.
 
-        Parameters
-        ----------
-        swap : FXSwapSpec
-            The FX swap position to hedge.
-
-        Returns
-        -------
-        dict
-            Keys: ticker, n_contracts (int), direction ('long'/'short'),
-            contract_size, residual_delta (unhedged remainder).
+        Returns dict keys: ticker, contract (e.g. "6E.c.4"), n_contracts (int),
+        direction ('long'/'short'), contract_size, hedge_price (futures price
+        used for sizing — equals spot for the legacy fallback path),
+        residual_delta.
         """
         pair = swap.pair
         if pair not in CME_FX_FUTURES:
             return {
                 "ticker": None,
+                "contract": None,
                 "n_contracts": 0,
                 "direction": "flat",
                 "contract_size": 0,
+                "hedge_price": 0.0,
                 "residual_delta": 0.0,
                 "error": f"No CME futures mapping for {pair}",
             }
@@ -403,13 +407,28 @@ class FXRiskAnalytics:
         spot = self.fx_spots.get(pair, 1.0)
         spot_delta = self.delta_spot(swap)
 
-        # Dollar value of one futures contract
-        # For EUR/USD: 125,000 EUR * 1.0850 USD/EUR = 135,625 USD per contract
-        contract_dollar_value = spec["contract_size"] * spot
+        # Pick the contract whose expiry is closest to the swap's maturity.
+        # Without a grid, fall back to the generic front-month root and use
+        # spot for sizing (legacy behaviour).
+        grid = self.futures_grids.get(pair)
+        if grid is not None and not grid.empty:
+            i_closest = (grid["expiry_years"] - swap.maturity_years).abs().idxmin()
+            row = grid.loc[i_closest]
+            contract = str(row["contract"])
+            hedge_price = float(row["price"])
+        else:
+            contract = spec["ticker"]
+            hedge_price = spot
+
+        # Dollar value of one futures contract = contract_size × futures_price
+        contract_dollar_value = spec["contract_size"] * hedge_price
 
         if contract_dollar_value == 0:
-            return {"ticker": spec["ticker"], "n_contracts": 0, "direction": "flat",
-                    "contract_size": spec["contract_size"], "residual_delta": spot_delta}
+            return {"ticker": spec["ticker"], "contract": contract,
+                    "n_contracts": 0, "direction": "flat",
+                    "contract_size": spec["contract_size"],
+                    "hedge_price": hedge_price,
+                    "residual_delta": spot_delta}
 
         n_contracts_raw = spot_delta / contract_dollar_value
         n_contracts = int(round(abs(n_contracts_raw)))
@@ -422,9 +441,11 @@ class FXRiskAnalytics:
 
         return {
             "ticker": spec["ticker"],
+            "contract": contract,
             "n_contracts": n_contracts,
             "direction": direction,
             "contract_size": spec["contract_size"],
+            "hedge_price": hedge_price,
             "residual_delta": residual,
         }
 

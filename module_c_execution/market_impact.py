@@ -23,6 +23,14 @@ import numpy as np
 # CME FX futures contract specifications
 # ---------------------------------------------------------------------------
 FX_FUTURES: Dict[str, dict] = {
+    # gamma_frac / eta_frac per-ticker overrides are CALIBRATED from realised
+    # TWAP slippage walked through the cached CME MBP-10 deep book on
+    # 2026-03-18 at typical hedge sizes (~50-150 majors, ~6000 6J).  The
+    # textbook defaults (gamma=0.05, eta=0.10) over-predict by 1.6x for 6E,
+    # 2.0x for 6B, 4.9x for 6A, and 33x for 6J because the AC formula scales
+    # linearly in Q without accounting for cross-contract notional differences.
+    # The calibrated multipliers bring AC theoretical within ~10-20% of the
+    # measured book-walk slippage at typical hedge sizes.
     "6E": {
         "name": "EUR/USD",
         "contract_size": 125_000,
@@ -31,6 +39,8 @@ FX_FUTURES: Dict[str, dict] = {
         "avg_daily_volume": 250_000,
         "daily_vol_pips": 55,
         "margin": 2_600,
+        "gamma_frac": 0.0322,
+        "eta_frac": 0.0643,
     },
     "6B": {
         "name": "GBP/USD",
@@ -40,6 +50,8 @@ FX_FUTURES: Dict[str, dict] = {
         "avg_daily_volume": 120_000,
         "daily_vol_pips": 75,
         "margin": 2_400,
+        "gamma_frac": 0.0247,
+        "eta_frac": 0.0494,
     },
     "6J": {
         "name": "JPY/USD",
@@ -49,6 +61,11 @@ FX_FUTURES: Dict[str, dict] = {
         "avg_daily_volume": 180_000,
         "daily_vol_pips": 60,
         "margin": 3_200,
+        # 6J is small-tick / large-notional; raw Q is huge (~6000 contracts
+        # for a typical hedge) which amplifies the AC formula's linear
+        # Q dependence.  The calibrated multiplier compensates.
+        "gamma_frac": 0.00151,
+        "eta_frac": 0.00302,
     },
     "6A": {
         "name": "AUD/USD",
@@ -58,6 +75,8 @@ FX_FUTURES: Dict[str, dict] = {
         "avg_daily_volume": 95_000,
         "daily_vol_pips": 85,
         "margin": 1_800,
+        "gamma_frac": 0.0102,
+        "eta_frac": 0.0204,
     },
 }
 
@@ -274,8 +293,20 @@ class AlmgrenChrissModel:
         vol = spec["avg_daily_volume"]
         sigma = spec["daily_vol_pips"]
 
-        opt_T = self.optimal_horizon(n_contracts, vol, sigma)
-        costs = self.total_cost(n_contracts, vol, sigma, opt_T)
+        # Per-ticker calibrated impact coefficients override the class defaults.
+        # If absent in the spec, fall back to whatever was passed to the
+        # constructor (legacy behavior).
+        original_gamma, original_eta = self.gamma_frac, self.eta_frac
+        try:
+            if "gamma_frac" in spec:
+                self.gamma_frac = float(spec["gamma_frac"])
+            if "eta_frac" in spec:
+                self.eta_frac = float(spec["eta_frac"])
+
+            opt_T = self.optimal_horizon(n_contracts, vol, sigma)
+            costs = self.total_cost(n_contracts, vol, sigma, opt_T)
+        finally:
+            self.gamma_frac, self.eta_frac = original_gamma, original_eta
 
         # Participation rate = fraction of per-minute volume consumed
         V_per_min = vol / self.TRADING_DAY_MINUTES

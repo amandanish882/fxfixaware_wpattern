@@ -22,6 +22,7 @@ Key empirical facts:
 import numpy as np
 import pandas as pd
 from datetime import datetime, time, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
@@ -83,6 +84,180 @@ def _build_intraday_vol_pattern() -> np.ndarray:
     # Normalize so they sum to 96 (i.e. average weight = 1.0)
     pattern = pattern / pattern.mean()
     return pattern
+
+
+# ======================================================================
+# CME MBP-1 / MBP-10 -> 15-min log-return aggregation
+# ======================================================================
+
+DEFAULT_CME_TICKER_TO_PAIR = {
+    "6E": "EUR/USD",
+    "6B": "GBP/USD",
+    "6J": "JPY/USD",
+    "6A": "AUD/USD",
+}
+
+
+def aggregate_cme_to_15m_returns(
+    mbp_df: pd.DataFrame,
+    ticker_to_pair: dict,
+) -> pd.DataFrame:
+    """Aggregate a CME MBP-1 / MBP-10 stream into 15-min mid-price log returns.
+
+    Parameters
+    ----------
+    mbp_df : pd.DataFrame
+        Must contain ``ts_event`` (or ``timestamp``), ``symbol`` (or ``ticker``),
+        plus top-of-book bid/ask. Bid/ask column names are auto-detected:
+        ``bid_px_00``/``ask_px_00`` first, then ``bid_px_0``/``ask_px_0``.
+    ticker_to_pair : dict
+        e.g. ``{"6E": "EUR/USD", "6B": "GBP/USD", "6J": "JPY/USD", "6A": "AUD/USD"}``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns ``timestamp``, ``pair``, ``return_15m`` (log returns).
+    """
+    empty = pd.DataFrame(columns=["timestamp", "pair", "return_15m"])
+
+    if mbp_df is None or len(mbp_df) == 0:
+        return empty
+
+    df = mbp_df
+
+    # 1) Timestamp column
+    if "ts_event" in df.columns:
+        ts = pd.to_datetime(df["ts_event"], utc=True)
+    elif "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"], utc=True)
+    elif isinstance(df.index, pd.DatetimeIndex):
+        ts = pd.to_datetime(df.index, utc=True)
+    else:
+        return empty
+
+    # 2) Bid/ask columns
+    if "bid_px_00" in df.columns and "ask_px_00" in df.columns:
+        bid = df["bid_px_00"].astype(float).to_numpy()
+        ask = df["ask_px_00"].astype(float).to_numpy()
+    elif "bid_px_0" in df.columns and "ask_px_0" in df.columns:
+        bid = df["bid_px_0"].astype(float).to_numpy()
+        ask = df["ask_px_0"].astype(float).to_numpy()
+    else:
+        return empty
+
+    # 3) Symbol / ticker column
+    if "symbol" in df.columns:
+        sym = df["symbol"].astype(str).to_numpy()
+    elif "ticker" in df.columns:
+        sym = df["ticker"].astype(str).to_numpy()
+    else:
+        return empty
+
+    mid = (bid + ask) / 2.0
+
+    # 4) Map each row to a ticker root via prefix-match
+    roots_arr = np.full(len(sym), None, dtype=object)
+    ticker_keys = list(ticker_to_pair.keys())
+    for i, s in enumerate(sym):
+        for root in ticker_keys:
+            if s.startswith(root):
+                roots_arr[i] = root
+                break
+
+    work = pd.DataFrame({
+        "ts": ts.values if hasattr(ts, "values") else ts,
+        "mid": mid,
+        "root": roots_arr,
+    })
+    work = work.dropna(subset=["root", "mid"])
+    if work.empty:
+        return empty
+
+    out_frames = []
+    for root, group in work.groupby("root"):
+        pair = ticker_to_pair.get(root)
+        if pair is None:
+            continue
+        g = group.set_index("ts").sort_index()
+        bucket = g["mid"].resample("15min", label="left", closed="left").last().dropna()
+        if len(bucket) < 2:
+            continue
+        rets = np.log(bucket).diff().dropna()
+        if rets.empty:
+            continue
+        out_frames.append(pd.DataFrame({
+            "timestamp": rets.index,
+            "pair": pair,
+            "return_15m": rets.values,
+        }))
+
+    if not out_frames:
+        return empty
+
+    result = pd.concat(out_frames, ignore_index=True)
+    result = result.sort_values("timestamp").reset_index(drop=True)
+    return result
+
+
+def build_cme_15m_cache(
+    cache_dir: Path,
+    output_path: Path,
+    ticker_to_pair: Optional[dict] = None,
+) -> int:
+    """Aggregate all MBP-1 parquets in ``cache_dir`` into one 15-min returns parquet.
+
+    Reads every ``mbp1_fx_*.parquet`` file under ``cache_dir``, concatenates them,
+    runs :func:`aggregate_cme_to_15m_returns`, and writes the result to
+    ``output_path``.
+
+    Parameters
+    ----------
+    cache_dir : Path
+        Directory containing ``mbp1_fx_*.parquet`` files.
+    output_path : Path
+        Destination parquet path (parent directory must exist).
+    ticker_to_pair : dict, optional
+        Defaults to ``DEFAULT_CME_TICKER_TO_PAIR``.
+
+    Returns
+    -------
+    int
+        Number of rows in the written cache. ``0`` if no files were found.
+    """
+    if ticker_to_pair is None:
+        ticker_to_pair = dict(DEFAULT_CME_TICKER_TO_PAIR)
+
+    cache_dir = Path(cache_dir)
+    output_path = Path(output_path)
+
+    files = sorted(cache_dir.glob("mbp1_fx_*.parquet"))
+    if not files:
+        return 0
+
+    frames = []
+    for fp in files:
+        try:
+            if fp.stat().st_size == 0:
+                continue
+        except OSError:
+            continue
+        try:
+            df = pd.read_parquet(fp)
+        except Exception:
+            continue
+        if df is None or len(df) == 0:
+            continue
+        frames.append(df)
+
+    if not frames:
+        return 0
+
+    combined = pd.concat(frames, ignore_index=True)
+    result = aggregate_cme_to_15m_returns(combined, ticker_to_pair)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result.to_parquet(output_path, index=False)
+    return len(result)
 
 
 class FixAlphaModel:
@@ -439,12 +614,15 @@ class FixAlphaModel:
         n_days: int = 252,
         seed: int = 42,
         prefer_real: bool = True,
+        prefer_cme: bool = True,
     ) -> Tuple[pd.DataFrame, str]:
-        """Get intraday data: tries REAL Yahoo Finance data first, falls back to synthetic.
+        """Get intraday data: tries CME aggregated data, then Yahoo Finance, then synthetic.
 
         Returns
         -------
-        (DataFrame, source_label) where source_label is "yahoo_finance" or "synthetic".
+        (DataFrame, source_label) where source_label is one of
+        ``"cme_aggregated"``, ``"yahoo_finance"``, ``"yahoo_finance_15m"``,
+        or ``"synthetic"``.
 
         Example
         -------
@@ -453,6 +631,23 @@ class FixAlphaModel:
         >>> print(f"Got {len(df)} rows from {source}")
         Got 96768 rows from yahoo_finance
         """
+        if prefer_cme:
+            cme_path = (
+                Path(__file__).resolve().parent.parent
+                / "data"
+                / "cme_15m_cache.parquet"
+            )
+            if cme_path.exists():
+                try:
+                    cme_df = pd.read_parquet(cme_path)
+                    if pairs is not None:
+                        cme_df = cme_df[cme_df["pair"].isin(pairs)]
+                    cme_df = cme_df.reset_index(drop=True)
+                    if not cme_df.empty:
+                        return cme_df, "cme_aggregated"
+                except Exception:
+                    pass
+
         if prefer_real:
             real = self.load_real_intraday_data(pairs=pairs, interval="1h", period="2y")
             if real is not None and len(real) > 1000:

@@ -1,5 +1,10 @@
-# Claude Code
+# Editor / agent tooling
 .claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+docs/superpowers/
 
 # Python
 __pycache__/
@@ -9,28 +14,33 @@ dist/
 build/
 *.so
 *.pyd
+*.pdb
 
-# Environment
+# C++ build artifacts (Windows / cross-compile)
+shared/cpp_kernel/build/
+
+# Environment / secrets
 .env
 .venv/
 venv/
 env/
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
+# Reference papers (copyrighted PDFs, not for distribution)
+reference/
 
-# Data caches (large files, reproducible)
+# Data caches (large; users regenerate via prefetch_data.py)
 data/databento_cache/
 data/yfinance_cache/
+data/dks_cache/
+data/dtcc_sdr_cache/
 data/cache/
+
+# Local debug helpers
+debug_attach.py
+build_debug.bat
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Keep output images for README (tracked explicitly)
-# Do NOT ignore output/*.png
-*.pdb
+# Note: output/*.png are intentionally tracked so README images render on GitHub.

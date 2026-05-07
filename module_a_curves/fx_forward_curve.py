@@ -256,6 +256,11 @@ class CrossCurrencyBasis:
             2Y     2.000000        -23.0
             5Y     5.000000        -25.0
         """
+        # If this instance was built from observed data (e.g. via
+        # `from_cme_futures`), short-circuit and return the observed curve.
+        if hasattr(self, "_observed") and pair in self._observed:
+            return self._observed[pair]
+
         if pair not in self._basis_data:
             raise ValueError(
                 f"Unknown pair {pair!r}. Available: {self.pairs}"
@@ -271,6 +276,79 @@ class CrossCurrencyBasis:
                 }
             )
         return pd.DataFrame(rows)
+
+    @classmethod
+    def from_cme_futures(
+        cls,
+        spot: float,
+        usd_curve,
+        foreign_curve,
+        futures_df: "pd.DataFrame",
+        pair: str,
+    ) -> "CrossCurrencyBasis":
+        """Construct a CrossCurrencyBasis from observed CME FX futures prices.
+
+        Project pair convention: ``"FOREIGN/USD"`` means S quoted as USD per
+        unit of FOREIGN (e.g. EUR/USD spot ≈ 1.17 USD per EUR).  Then the
+        no-basis CIP forward is
+
+            F_cip(t) = S * df_for(t) / df_usd(t)
+
+        which is the same formula used by ``FXForwardCurve.forward(t)`` (see
+        module docstring).  The cross-currency basis is the simple decay
+        factor that closes the gap between F_cip and the observed forward:
+
+            F_obs = F_cip * exp(-ccb(t) * t)
+            => ccb(t) = -ln(F_cip / F_obs) / t
+
+        Negative ccb (typical for non-USD G4 pairs post-2008) means
+        F_obs < F_cip, i.e. the observed forward sits below CIP -- consistent
+        with non-USD floats paying a spread to swap into USD.
+
+        Parameters
+        ----------
+        spot : float
+            FX spot at valuation date in USD per FOREIGN.
+        usd_curve, foreign_curve : DiscountCurve
+            OIS curves with .df(t) method.
+        futures_df : pd.DataFrame
+            Columns: ``contract``, ``expiry_years``, ``price``.
+        pair : str
+            Currency pair string, e.g. ``"EUR/USD"``.
+        """
+        rows = []
+        for _, row in futures_df.iterrows():
+            t = float(row["expiry_years"])
+            if t <= 0.0:
+                continue
+            f_obs = float(row["price"])
+            df_usd = usd_curve.df(t)
+            df_for = foreign_curve.df(t)
+            # CIP forward in the project's "FOREIGN/USD" convention:
+            #   F_cip = S * df_foreign / df_usd  (matches FXForwardCurve.forward)
+            f_cip = spot * df_for / df_usd
+            ccb = -np.log(f_cip / f_obs) / t
+
+            # Tenor-label heuristic: months for t < 1Y, else integer years.
+            months = int(round(t * 12))
+            if months < 12:
+                tenor_label = f"{months}M"
+            else:
+                tenor_label = f"{int(round(t))}Y"
+
+            rows.append(
+                {
+                    "tenor": tenor_label,
+                    "maturity_years": round(t, 6),
+                    "basis_bps": float(ccb * 1e4),
+                }
+            )
+        observed_df = pd.DataFrame(rows, columns=["tenor", "maturity_years", "basis_bps"])
+
+        instance = cls.__new__(cls)
+        instance._basis_data = _REALISTIC_BASIS_BPS
+        instance._observed = {pair: observed_df}
+        return instance
 
     def basis_at_tenor(self, pair: str, tenor: str) -> float:
         """Return the basis in bps for a specific *pair* and *tenor*.

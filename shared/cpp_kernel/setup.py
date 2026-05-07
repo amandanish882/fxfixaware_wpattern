@@ -1,11 +1,17 @@
 """
-Build script for fx_pricing_kernel C++ extension.
+Build script for fx_pricing_kernel C++ extension (RELEASE).
 
 Usage:
+    pip install .
+    # or
     python setup.py build_ext --inplace
 
-The built .pyd (Windows) or .so (Linux) is copied to the project root
-so it can be imported directly: `import fx_pricing_kernel`
+Debug builds:
+    Windows: python setup_debug.py build_ext --inplace
+    macOS:   python setup_debug_mac.py build_ext --inplace
+
+The built .pyd (Windows) or .so (Linux/macOS) is copied to the project root
+so it can be imported directly: `import fx_pricing_kernel`.
 """
 
 import os

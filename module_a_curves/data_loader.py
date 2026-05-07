@@ -15,6 +15,10 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from shared.foreign_ois_loader import fetch_foreign_ois_curve
+from shared.databento_curve_loader import fetch_sofr_strip
+from module_a_curves.sofr_futures_bootstrap import bootstrap_usd_ois_from_strip
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -276,6 +280,48 @@ class FXDataLoader:
             return {k: list(v) for k, v in _CB_DATES_2026.items()}
         logger.warning("No embedded central-bank dates for year %d", year)
         return {"FOMC": [], "ECB": [], "BOE": []}
+
+    def get_real_foreign_ois_curve(self, currency: str, date_str: str) -> dict[float, float]:
+        """Fetch a real foreign OIS / risk-free term structure from a central-bank free API.
+
+        Currently supported: ``"EUR"`` (ECB SDW), ``"GBP"`` (BoE IADB),
+        ``"JPY"`` (BoJ TONA via FRED), ``"AUD"`` (RBA F1).
+
+        Returns
+        -------
+        dict[float, float]
+            Tenor in years -> zero rate decimal. Empty dict if the source failed.
+        """
+        return fetch_foreign_ois_curve(currency, date_str)
+
+    def get_real_usd_ois_curve(self, date_str: str):
+        """Bootstrap a real USD OIS DiscountCurve from cached CME SOFR (SR3) futures.
+
+        The overnight anchor (t = 1/365) is the real FRED ``SOFR`` fixing on or
+        before ``date_str`` when available; otherwise the front SR3 contract's
+        implied rate is used as a fallback.
+
+        Returns a DiscountCurve, or None if the SOFR strip cache is missing/empty.
+        """
+        strip = fetch_sofr_strip(date_str)
+        if strip is None or strip.empty:
+            return None
+
+        # Real overnight SOFR fixing from FRED (free, daily). Falls back to
+        # SR3.c.0 implied rate if FRED unavailable / no API key / no fixing
+        # for the requested date.
+        on_rate: Optional[float] = None
+        try:
+            rates = self.get_ois_rates(date_str)
+            sofr_overnight = rates.get("SOFR")
+            if sofr_overnight is not None and sofr_overnight > 0:
+                on_rate = float(sofr_overnight)
+        except Exception as exc:
+            logger.warning("FRED SOFR overnight fetch failed: %s", exc)
+
+        return bootstrap_usd_ois_from_strip(
+            strip, valuation_date=date_str, overnight_rate=on_rate,
+        )
 
     # ------------------------------------------------------------------
     # FRED API Helpers
