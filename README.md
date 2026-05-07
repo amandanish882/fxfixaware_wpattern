@@ -356,7 +356,9 @@ Decile calibration is within ±0.05 across all 10 buckets — the model is well-
 
 Trade P&L is decomposed by an **additive identity** that holds exactly by construction:
 
-$$\text{total\_pnl} = \text{edge} + \text{fix\_alpha} + \text{carry} + \text{hedge\_cost} + \text{markout\_drift}$$
+```
+total_pnl  =  edge  +  fix_alpha  +  carry  +  hedge_cost  +  markout_drift
+```
 
 | Component | What it captures | How it's computed |
 |---|---|---|
