@@ -34,6 +34,9 @@ data/yfinance_cache/
 data/dks_cache/
 data/dtcc_sdr_cache/
 data/cache/
+data/cme_15m_basis_cache.parquet
+data/exchange_rfr_cache/
+data/foreign_ois_cache/
 
 # Local debug helpers
 debug_attach.py
