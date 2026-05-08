@@ -291,7 +291,7 @@ class AdaptiveScheduler:
             # kappa ≈ 0 → uniform (TWAP)
             weights = np.ones(self.n_slices)
         else:
-            weights = np.sinh(self.kappa * t_points)
+            weights = np.sinh(self.kappa * (1.0 - t_points + t_points[0]))
 
         # Normalise
         weight_sum = weights.sum()
